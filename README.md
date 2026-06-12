@@ -1,5 +1,3 @@
-<<<<<<< HEAD
-<<<<<<< HEAD
 # Backend Service - PPE Detection API
 
 FastAPI-based inference service for YOLO model predictions.
@@ -91,8 +89,3 @@ Supported model formats:
 
 Place models in the `../models/` directory.
 =======
-# RVCE-PPE-backend-service
->>>>>>> 59ec922be728d842523f40bec8d81cf7bf14a7a8
-=======
-# RVCE-PPE-backend-service
->>>>>>> 6eeccfb351f5d3bc688d238e70967fb10b5c84c2

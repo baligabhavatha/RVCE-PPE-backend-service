@@ -7,8 +7,7 @@ from collections import deque
 import multiprocessing
 from typing import Optional, Dict, List
 import warnings
-import subprocess 
-import uuid
+import subprocess
 
 warnings.filterwarnings('ignore', category=RuntimeWarning)
 
@@ -57,67 +56,11 @@ CLASS_COLORS = {
 }
 DEFAULT_COL = (200, 200, 200)
 
-def convert_video_for_pi(input_path: str):
-    """
-    Convert uploaded video into Raspberry Pi friendly format
-    Uses lower resolution, frame rate, and codec settings optimized for Pi
-    """
-
-    output_path = f"/tmp/{uuid.uuid4().hex}_pi.mp4"
-
-    cmd = [
-        "ffmpeg",
-        "-y",
-        "-i", input_path,
-
-        # Resize to lower resolution + reduce FPS for Pi performance
-        "-vf", "scale=640:360,fps=10",
-
-        # Pi friendly H.264 encoding with baseline profile
-        "-c:v", "libx264",
-        "-preset", "ultrafast",
-        "-pix_fmt", "yuv420p",
-        "-profile:v", "baseline",
-        "-level", "3.0",
-        
-        # Additional flags for better compatibility
-        "-movflags", "+faststart",
-        "-max_muxing_queue_size", "1024",
-
-        # Lower quality = smaller file size and faster processing
-        "-crf", "28",
-
-        # Remove audio to reduce file size
-        "-an",
-
-        output_path
-    ]
-
-    print(f"Converting video for Raspberry Pi: {input_path}")
-    print(f"Output will be: {output_path}")
-
-    try:
-        result = subprocess.run(
-            cmd,
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=300  # 5 minute timeout
-        )
-        print("Video conversion completed successfully")
-        return output_path
-    except subprocess.TimeoutExpired:
-        raise Exception("Video conversion timed out (>5 minutes)")
-    except subprocess.CalledProcessError as e:
-        print(f"FFmpeg error: {e.stderr}")
-        raise Exception(f"Video conversion failed: {e.stderr}")
-    except FileNotFoundError:
-        raise Exception("FFmpeg not found. Please install ffmpeg on your Raspberry Pi: sudo apt-get install ffmpeg")
 
 class ProcessingConfig(BaseModel):
     """Configuration for video processing"""
     # Model settings
-    model_path: str = "models/ppe.onnx"
+    model_path: str = "models/ppe_ncnn_model"
     model_mode: str = "PPE"  # "PPE" or "Default"
     conf_threshold: float = 0.5
     imgsz: int = 384
@@ -177,7 +120,16 @@ def load_model_if_needed(weights_path: str):
         model = YOLO(weights_path, task='detect')  # Explicitly set task to avoid warnings
         model_path = weights_path
         print(f"Model loaded successfully: {weights_path}")
-    
+
+        # Warm up: first inference pays JIT/graph-build cost (often 1-3s on Pi).
+        # Doing it here means the first real frame from a client is fast.
+        try:
+            dummy = np.zeros((384, 384, 3), dtype=np.uint8)
+            model.predict(dummy, verbose=False, imgsz=384, device='cpu', half=False)
+            print("Model warmup complete")
+        except Exception as e:
+            print(f"Model warmup failed (non-fatal): {e}")
+
     return model
 
 
@@ -247,22 +199,32 @@ def read_video_with_ffmpeg(video_path: str):
         stderr=subprocess.DEVNULL,
         bufsize=10**8
     )
-    
+
     frame_size = width * height * 3  # 3 bytes per pixel (BGR)
-    
-    while True:
-        raw_frame = process.stdout.read(frame_size)
-        if len(raw_frame) != frame_size:
-            break
-        
-        # Convert raw bytes to numpy array
-        frame = np.frombuffer(raw_frame, dtype=np.uint8)
-        frame = frame.reshape((height, width, 3))
-        
-        yield frame
-    
-    process.stdout.close()
-    process.wait()
+
+    try:
+        while True:
+            raw_frame = process.stdout.read(frame_size)
+            if len(raw_frame) != frame_size:
+                break
+
+            frame = np.frombuffer(raw_frame, dtype=np.uint8)
+            frame = frame.reshape((height, width, 3))
+
+            yield frame
+    finally:
+        # Runs on normal exit, on generator.close(), and on exceptions in the caller.
+        try:
+            process.stdout.close()
+        except Exception:
+            pass
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
 
 
 def process_frame(frame: np.ndarray, config: ProcessingConfig, 
@@ -282,15 +244,23 @@ def process_frame(frame: np.ndarray, config: ProcessingConfig,
     # Determine classes to detect
     det_classes = None if PPE_MODE else [0]  # person class
     
-    # Run inference
+    # Run inference with Pi-optimized settings.
+    # Default mode counts zone entries, which needs IDs that persist across frames
+    # — so we use track() there. PPE mode just labels detections, predict() is fine.
     t_inf_start = time.perf_counter()
-    results = current_model.predict(
-        frame,
+    common_args = dict(
         conf=config.conf_threshold,
         verbose=False,
         imgsz=config.imgsz,
         classes=det_classes,
+        half=False,  # No FP16 on Pi CPU
+        device='cpu',  # Explicitly use CPU
+        max_det=50,  # Limit detections for speed
     )
+    if PPE_MODE:
+        results = current_model.predict(frame, **common_args)
+    else:
+        results = current_model.track(frame, persist=True, tracker="bytetrack.yaml", **common_args)
     t_inf_end = time.perf_counter()
     inference_time_ms = (t_inf_end - t_inf_start) * 1000
     
@@ -316,15 +286,23 @@ def process_frame(frame: np.ndarray, config: ProcessingConfig,
     boxes = res.boxes
     
     if boxes is not None:
-        ids = list(range(len(boxes)))
+        # Prefer tracker IDs (persistent across frames) when present; otherwise
+        # fall back to per-frame indices. Counters in Default mode rely on this.
+        if boxes.id is not None:
+            ids = boxes.id.int().cpu().tolist()
+        else:
+            ids = list(range(len(boxes)))
         xyxy = boxes.xyxy.cpu().tolist()
         confs = boxes.conf.cpu().tolist()
         clss = boxes.cls.int().cpu().tolist() if boxes.cls is not None else []
         
+        # Get class names - handle None case for NCNN models
+        class_names = current_model.names if current_model.names is not None else {}
+        
         for tid, (x1, y1, x2, y2), conf, cls_id in zip(ids, xyxy, confs, clss):
             x1, y1, x2, y2 = map(int, (x1, y1, x2, y2))
             cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-            class_name = current_model.names.get(cls_id, str(cls_id))
+            class_name = class_names.get(cls_id, str(cls_id))
             col = color_for(class_name)
             
             detections.append({
@@ -458,32 +436,33 @@ async def websocket_process(websocket: WebSocket):
     t_last = time.time()
     frames_count = 0
     fps = 0.0
-    
+
+    # Pre-init resources so the finally block can release them on any exit path.
+    cap = None
+    frame_generator = None
+    use_ffmpeg_direct = False
+
     try:
         # Receive configuration
         config_data = await websocket.receive_json()
         config = ProcessingConfig(**config_data)
-        
+
         # Open video capture
         if config.video_source is None:
             await websocket.send_json({"error": "No video source provided"})
             return
-            
-        use_ffmpeg_direct = False
-        frame_generator = None
-        
+
         if config.video_source_type == "File":
             print(f"Original video file: {config.video_source}")
-            
+
             # Check if file exists
             if not os.path.exists(config.video_source):
                 await websocket.send_json({"error": f"Video file not found: {config.video_source}"})
                 return
-            
+
             print(f"Opening video file: {config.video_source}")
-            
+
             # Try multiple backends for better compatibility on Raspberry Pi
-            cap = None
             backends_to_try = [
                 ("FFMPEG", cv2.CAP_FFMPEG),
                 ("GSTREAMER", cv2.CAP_GSTREAMER),
@@ -597,9 +576,10 @@ async def websocket_process(websocket: WebSocket):
             if frame_num % 30 == 0:
                 print(f"Processing frame {frame_num}...")
             
-            # Process frame
-            annotated, detections, entries_roi, entries_nogo, person_in_nogo, inf_time = process_frame(
-                frame, config, prev_in_roi, prev_in_nogo, entries_roi, entries_nogo
+            # Process frame in a worker thread so the event loop stays responsive
+            # (WebSocket ping/pong, /stop, etc.) during CPU-bound inference.
+            annotated, detections, entries_roi, entries_nogo, person_in_nogo, inf_time = await asyncio.to_thread(
+                process_frame, frame, config, prev_in_roi, prev_in_nogo, entries_roi, entries_nogo
             )
             
             # Calculate FPS
@@ -632,16 +612,28 @@ async def websocket_process(websocket: WebSocket):
             
             # Small delay to prevent overwhelming the connection
             await asyncio.sleep(0.01)
-        
-        cap.release()
-        
+
     except WebSocketDisconnect:
         print("WebSocket disconnected")
     except Exception as e:
         print(f"Error in websocket: {e}")
-        await websocket.send_json({"error": str(e)})
+        try:
+            await websocket.send_json({"error": str(e)})
+        except Exception:
+            pass
     finally:
         processing_active = False
+        if cap is not None:
+            try:
+                cap.release()
+            except Exception:
+                pass
+        if frame_generator is not None:
+            # Triggers the try/finally in read_video_with_ffmpeg, which kills the subprocess.
+            try:
+                frame_generator.close()
+            except Exception:
+                pass
 
 
 @app.post("/stop")
@@ -653,8 +645,6 @@ async def stop_processing():
 
 
 if __name__ == "__main__":
-    # Backend runs on port 8000 (default)
-    # Change port here if needed: uvicorn.run(app, host="0.0.0.0", port=5000)
     uvicorn.run(app, host="0.0.0.0", port=8009)
 
 # Made with Bob
